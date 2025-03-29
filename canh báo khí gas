@@ -1,36 +1,42 @@
 #define DEBUG
-#include "espConfig.h"
-#include <BlynkSimpleEsp32.h>
+#include "espConfig.h" // Giả sử đây là file cấu hình Blynk của bạn
+#include <DHT.h>
 
-int buzzer = 5;     // GPIO5
-int relay = 4;      // GPIO4
-int ledMode = 14;   // GPIO14
-int button = 0;     // GPIO0
-int mucCanhbao;
+// Định nghĩa chân cho ESP32
+#define DHTPIN 22          // Chân DATA của DHT22 nối với GPIO22
+#define DHTTYPE DHT22      // Loại cảm biến là DHT22
+#define relayPin 5         // Chân điều khiển relay cho còi 12V nối với GPIO5
+#define button 15          // Nút nhấn nối với GPIO15
+#define MQ2_PIN 34         // Cảm biến MQ2 nối với GPIO34 (ADC1_6)
+
+// Khai báo biến
+int mucCanhbao;            // Mức cảnh báo cho MQ2 từ Blynk
+float tempThreshold = 32.0; // Ngưỡng nhiệt độ cho cảnh báo
+BlynkTimer timer;
+int timerID1, timerID2;
 float mq2_value;
-bool buttonState = HIGH;
-bool runMode = 0;
-bool canhbaoState = 0;
-WidgetLED led(V0);
+boolean buttonState = HIGH;
+boolean runMode = 0;       // Bật/tắt chế độ cảnh báo
+boolean canhbaoState = 0;
+
+// Định nghĩa pin ảo cho Blynk
 #define GAS V1
 #define MUCCANHBAO V2
 #define CANHBAO V3
 #define CHEDO V4
+#define TEMP V5            // Pin ảo cho nhiệt độ
+#define HUMID V6           // Pin ảo cho độ ẩm
 
-BlynkTimer timer;
-int timerID1, timerID2;
+DHT dht(DHTPIN, DHTTYPE);
 
 void setup() {
   Serial.begin(115200);
-  pinMode(button, INPUT_PULLUP);
-  pinMode(buzzer, OUTPUT);
-  pinMode(relay, OUTPUT);
-  pinMode(ledMode, OUTPUT);
-  digitalWrite(buzzer, LOW);
-  digitalWrite(relay, LOW);
-
-  timerID1 = timer.setInterval(1000L, handleTimerID1);
-  espConfig.begin();
+  pinMode(button, INPUT_PULLUP);   // Nút nhấn với pull-up nội bộ
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, HIGH);    // Tắt relay ban đầu (giả sử HIGH là tắt)
+  dht.begin();                     // Khởi động cảm biến DHT22
+  timerID1 = timer.setInterval(1000L, handleTimerID1); // Timer chạy mỗi 1 giây
+  espConfig.begin();               // Khởi động Blynk (giả sử từ file espConfig.h)
 }
 
 void loop() {
@@ -40,14 +46,13 @@ void loop() {
 
 void app_loop() {
   timer.run();
-  if (digitalRead(button) == LOW) {
+  if (digitalRead(button) == LOW) {  // Phát hiện nút nhấn
     if (buttonState == HIGH) {
       buttonState = LOW;
-      runMode = !runMode;
-      digitalWrite(ledMode, runMode);
+      runMode = !runMode;            // Đổi trạng thái chế độ cảnh báo
       Serial.println("Run mode: " + String(runMode));
       Blynk.virtualWrite(CHEDO, runMode);
-      delay(200);
+      delay(200);                    // Chống dội nút
     }
   } else {
     buttonState = HIGH;
@@ -55,55 +60,75 @@ void app_loop() {
 }
 
 void handleTimerID1() {
-  int mq2 = analogRead(34);  // Chuyển sang GPIO34 (ESP32 không có A0)
-  float voltage = mq2 * (3.3 / 4095.0);  // ESP32 dùng 12-bit ADC và điện áp 3.3V
+  // Đọc giá trị từ cảm biến MQ2
+  int mq2 = analogRead(MQ2_PIN);
+  float voltage = mq2 / 4095.0 * 3.3; // ESP32: ADC 12-bit, nguồn 3.3V
   float ratio = voltage / 1.4;
   mq2_value = 1000.0 * pow(10, ((log10(ratio) - 1.0278) / 0.6629));
-
   Serial.println("Gas: " + String(mq2_value, 0) + "ppm");
   Blynk.virtualWrite(GAS, mq2_value);
 
-  led.setValue(!led.getValue()); // Nhấp nháy LED trạng thái trên Blynk
+  // Đọc giá trị từ DHT22
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("Lỗi cảm biến DHT22!");
+    return;
+  }
+  Serial.println("Nhiệt độ: " + String(temperature) + "°C, Độ ẩm: " + String(humidity) + "%");
+  Blynk.virtualWrite(TEMP, temperature);
+  Blynk.virtualWrite(HUMID, humidity);
 
-  if (runMode) {
-    if (mq2_value > mucCanhbao) {
-      if (!canhbaoState) {
+  // Logic cảnh báo
+  if (runMode == 1) {
+    if (mq2_value > mucCanhbao || temperature > tempThreshold) {
+      if (canhbaoState == 0) {
         canhbaoState = 1;
-        Blynk.logEvent("canhbao", "Cảnh báo! Khí gas = " + String(mq2_value) + "ppm vượt quá mức cho phép!");
-        timerID2 = timer.setTimeout(60000L, handleTimerID2);
+        String message = "Cảnh báo! ";
+        if (mq2_value > mucCanhbao) {
+          message += "Khí gas=" + String(mq2_value) + "ppm ";
+        }
+        if (temperature > tempThreshold) {
+          message += "Nhiệt độ=" + String(temperature) + "°C";
+        }
+        Blynk.logEvent("canhbao", message); // Gửi thông báo qua Blynk
+        timerID2 = timer.setTimeout(60000L, handleTimerID2); // Đặt timeout 60 giây
       }
-      digitalWrite(buzzer, HIGH);
-      digitalWrite(relay, HIGH);
+      canh_bao(); // Kích hoạt còi 12V
       Blynk.virtualWrite(CANHBAO, HIGH);
       Serial.println("Đã bật cảnh báo!");
     } else {
-      tatCanhBao();
+      digitalWrite(relayPin, HIGH); // Tắt còi
+      Blynk.virtualWrite(CANHBAO, LOW);
+      Serial.println("Đã tắt cảnh báo!");
     }
   } else {
-    tatCanhBao();
+    digitalWrite(relayPin, HIGH); // Tắt còi khi chế độ cảnh báo tắt
+    Blynk.virtualWrite(CANHBAO, LOW);
+    Serial.println("Đã tắt cảnh báo!");
   }
 }
 
-void tatCanhBao() {
-  digitalWrite(buzzer, LOW);
-  digitalWrite(relay, LOW);
-  Blynk.virtualWrite(CANHBAO, LOW);
-  Serial.println("Đã tắt cảnh báo!");
-}
-
 void handleTimerID2() {
-  canhbaoState = 0;
+  canhbaoState = 0; // Reset trạng thái cảnh báo sau 60 giây
 }
 
+void canh_bao() {
+  digitalWrite(relayPin, LOW);  // Bật còi 12V qua relay
+  delay(8000);                  // Bật trong 8 giây
+  digitalWrite(relayPin, HIGH); // Tắt còi
+  delay(8000);                  // Tắt trong 8 giây
+}
+
+// Sự kiện Blynk
 BLYNK_CONNECTED() {
-  Blynk.syncAll();
+  Blynk.syncAll(); // Đồng bộ dữ liệu khi kết nối
 }
 
 BLYNK_WRITE(MUCCANHBAO) {
-  mucCanhbao = param.asInt();
+  mucCanhbao = param.asInt(); // Nhận mức cảnh báo từ Blynk
 }
 
 BLYNK_WRITE(CHEDO) {
-  runMode = param.asInt();
-  digitalWrite(ledMode, runMode);
+  runMode = param.asInt(); // Nhận trạng thái chế độ từ Blynk
 }
